@@ -1,0 +1,99 @@
+# SpaceDuck — unsigned iOS build (GitHub Actions, no Mac, no paid account)
+#
+# Runs on macos-26 (Xcode 26.6 default), configures with CMake (Xcode
+# generator — required for the AUv3 target), builds the Standalone app
+# unsigned, packages it as an .ipa, and uploads it as a build artifact.
+# Bryce downloads the .ipa from the Actions run page and installs it with
+# SideStore. See STEP-BY-STEP.md for the full walkthrough.
+#
+# Design notes (see README.md for sources):
+# - Unsigned on purpose: CODE_SIGNING_ALLOWED=NO + CODE_SIGNING_REQUIRED=NO
+#   + CODE_SIGN_IDENTITY="" — no team, no certificates on the runner.
+#   SideStore signs the .ipa on the iPad with the free Apple ID instead.
+# - Plain `cmake --build` (not `xcodebuild archive`): the archive route is
+#   unverified for JUCE AUv3 targets; plain build is the safer path.
+# - The .ipa is uploaded as an artifact (retention 30 days). Artifacts are
+#   not a distribution channel — download it promptly.
+# - The built .app is located dynamically (not a hardcoded path): an
+#   earlier run showed the build step can report success while the app
+#   is not at the assumed Release-iphoneos path, so the Inspect step
+#   finds whatever .app the build produced and fails with a full
+#   directory listing if there is none.
+
+name: Build SpaceDuck (iOS, unsigned)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Assert Xcode version
+        run: |
+          xcodebuild -version
+          cmake --version
+
+      - name: Configure (iOS, unsigned)
+        run: >
+          cmake -B build-ios -G Xcode
+          -DCMAKE_SYSTEM_NAME=iOS
+          -DCMAKE_OSX_SYSROOT=iphoneos
+          -DCMAKE_OSX_ARCHITECTURES=arm64
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
+          -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO
+          -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO
+          -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY=""
+
+      - name: Build Standalone app (unsigned)
+        run: >
+          cmake --build build-ios --config Release
+          --target SpaceDuck_Standalone
+          -- CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Inspect the built app
+        run: |
+          echo "--- built products tree ---"
+          find build-ios/Build -maxdepth 4 -print || true
+          APP_PATH=$(find build-ios -name "*.app" -type d -not -path "*/_deps/*" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: no .app found under build-ios"
+            find build-ios -maxdepth 5 -type d -print
+            exit 1
+          fi
+          echo "app: $APP_PATH"
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+          echo "--- app bundle ---"
+          find "$APP_PATH" -maxdepth 3 -print
+          echo "--- AUv3 extension bundle ID (must start with com.dudelampoon.spaceduck) ---"
+          APPEX=$(find "$APP_PATH" -name "*.appex" -maxdepth 3 | head -n 1)
+          if [ -z "$APPEX" ]; then
+            echo "ERROR: no .appex found inside the app bundle"
+            exit 1
+          fi
+          echo "appex: $APPEX"
+          /usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "$APPEX/Info.plist"
+          echo "--- app bundle ID ---"
+          /usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "$APP_PATH/Info.plist"
+
+      - name: Package unsigned .ipa
+        run: |
+          mkdir -p dist/Payload
+          cp -R "$APP_PATH" dist/Payload/
+          cd dist && zip -r -y SpaceDuck.ipa Payload
+          ls -la SpaceDuck.ipa
+
+      - name: Upload .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpaceDuck-ipa
+          path: dist/SpaceDuck.ipa
+          retention-days: 30
